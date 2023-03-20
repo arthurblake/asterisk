@@ -1401,6 +1401,11 @@ struct ast_filestream *ast_readfile(const char *filename, const char *type, cons
 
 struct ast_filestream *ast_writefile(const char *filename, const char *type, const char *comment, int flags, int check, mode_t mode)
 {
+	return ast_writefile_buf(filename, type, comment, flags, check, mode, 32768);
+}
+
+struct ast_filestream *ast_writefile_buf(const char *filename, const char *type, const char *comment, int flags, int check, mode_t mode, int bufsize)
+{
 	int fd, myflags = 0;
 	/* compiler claims this variable can be used before initialization... */
 	FILE *bfile = NULL;
@@ -1409,6 +1414,12 @@ struct ast_filestream *ast_writefile(const char *filename, const char *type, con
 	char *buf = NULL;
 	size_t size = 0;
 	int format_found = 0;
+
+	// default bufsize is 32K
+	if (bufsize <= 0)
+	{
+		bufsize = 32768;
+	}
 
 	AST_RWLIST_RDLOCK(&formats);
 
@@ -1485,8 +1496,8 @@ struct ast_filestream *ast_writefile(const char *filename, const char *type, con
 			errno = 0;
 			fs = get_filestream(f, bfile);
 			if (fs) {
-				if ((fs->write_buffer = ast_malloc(32768))) {
-					setvbuf(fs->f, fs->write_buffer, _IOFBF, 32768);
+				if ((fs->write_buffer = ast_malloc(bufsize))) {
+					setvbuf(fs->f, fs->write_buffer, _IOFBF, bufsize);
 				}
 			}
 			if (!fs || rewrite_wrapper(fs, comment)) {
