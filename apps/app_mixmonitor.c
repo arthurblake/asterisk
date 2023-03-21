@@ -508,6 +508,19 @@ static void mixmonitor_ds_close_fs(struct mixmonitor_ds *mixmonitor_ds)
 	}
 }
 
+/*!
+ * \internal
+ * \pre mixmonitor_ds must be locked before calling this function
+ */
+static void mixmonitor_ds_close_fs_read(struct mixmonitor_ds *mixmonitor_ds)
+{
+	if (mixmonitor_ds->fs_read) {
+		ast_closestream(mixmonitor_ds->fs_read);
+		mixmonitor_ds->fs_read = NULL;
+		ast_verb(2, "MixMonitor close filestream (read) early @ 6.5sec for EAMD\n");
+	}
+}
+
 static void mixmonitor_ds_destroy(void *data)
 {
 	struct mixmonitor_ds *mixmonitor_ds = data;
@@ -735,6 +748,8 @@ static void *mixmonitor_thread(void *obj)
 	unsigned int oflags;
 	int errflag = 0;
 	struct ast_format *format_slin;
+	int eamd_samples_remaining;
+
 
 	/* Keep callid association before any log messages */
 	if (mixmonitor->callid) {
@@ -755,6 +770,9 @@ static void *mixmonitor_thread(void *obj)
 	format_slin = ast_format_cache_get_slin_by_rate(mixmonitor->mixmonitor_ds->samp_rate);
 
 	ast_mutex_unlock(&mixmonitor->mixmonitor_ds->lock);
+
+	/* collect 6.5 seconds of samples for EAMD (AmeriSave Enahnced AMD) */
+	eamd_samples_remaining = (65 * mixmonitor->mixmonitor_ds->samp_rate) / 10;
 
 	/* The audiohook must enter and exit the loop locked */
 	ast_audiohook_lock(&mixmonitor->audiohook);
@@ -785,8 +803,25 @@ static void *mixmonitor_thread(void *obj)
 			if ((*fs_read) && (fr_read)) {
 				struct ast_frame *cur;
 
-				for (cur = fr_read; cur; cur = AST_LIST_NEXT(cur, frame_list)) {
+				for (cur = fr_read; cur && eamd_samples_remaining > 0; cur = AST_LIST_NEXT(cur, frame_list)) {
 					ast_writestream(*fs_read, cur);
+					/*
+						Flush file on every frame so EAMD process can get near realtime
+						output (at least at the frame granularity)
+						Recording should be saved to a RAM drive for even better performance
+						and to eliminate file fragmentation issues
+					*/
+					fflush((*fs_read)->f);
+					eamd_samples_remaining -= cur->samples;
+					if (eamd_samples_remaining <= 0)
+					{
+						// once we've passed 6.5 seconds, close and delete the file
+						mixmonitor_ds_close_fs_read(mixmonitor->mixmonitor_ds);
+						if (!ast_strlen_zero(fs_read_ext)) {
+							ast_filedelete(mixmonitor->filename_read, fs_read_ext);
+						}
+						break;
+					}
 				}
 			}
 
@@ -880,10 +915,10 @@ static void *mixmonitor_thread(void *obj)
 			ast_filedelete(mixmonitor->filename, fs_ext);
 		}
 		if (!ast_strlen_zero(fs_read_ext)) {
-			ast_filedelete(mixmonitor->filename_read, fs_ext);
+			ast_filedelete(mixmonitor->filename_read, fs_ext); /* isn't this a bug? 2nd arg should be fs_read_ext */
 		}
 		if (!ast_strlen_zero(fs_write_ext)) {
-			ast_filedelete(mixmonitor->filename_write, fs_ext);
+			ast_filedelete(mixmonitor->filename_write, fs_ext); /* isn't this a bug? 2nd arg should be fs_write_ext */
 		}
 	}
 
