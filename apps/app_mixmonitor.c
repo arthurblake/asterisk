@@ -98,7 +98,15 @@
 					<option name="d">
 						<para>Delete the recording file as soon as MixMonitor is done with it.</para>
 						<para>For example, if you use the m option to dispatch the recording to a voicemail box,
-						you can specify this option to delete the original copy of it afterwards.</para>
+						you can specify this option to delete the original copy of it afterwards.
+						(This has no effect on the eamd receive audio file.)</para>
+					</option>
+					<option name="e">
+						<argument name="file" required="true" />
+						<para>Use the specified file to record the <emphasis>eamd receive</emphasis> audio feed
+						for up to the first 10 seconds with minimal buffering.
+						Like with the basic filename argument, if an absolute path isn't given, it will create
+						the file in the configured monitoring directory.</para>
 					</option>
 					<option name="v">
 						<para>Adjust the <emphasis>heard</emphasis> volume by a factor of <replaceable>x</replaceable>
@@ -379,6 +387,7 @@ struct mixmonitor {
 	char *filename;
 	char *filename_read;
 	char *filename_write;
+	char *filename_eamd;
 	char *post_process;
 	char *name;
 	ast_callid callid;
@@ -409,16 +418,17 @@ enum mixmonitor_flags {
 	MUXFLAG_WRITEVOLUME = (1 << 5),
 	MUXFLAG_READ = (1 << 6),
 	MUXFLAG_WRITE = (1 << 7),
-	MUXFLAG_COMBINED = (1 << 8),
-	MUXFLAG_UID = (1 << 9),
-	MUXFLAG_VMRECIPIENTS = (1 << 10),
-	MUXFLAG_BEEP = (1 << 11),
-	MUXFLAG_BEEP_START = (1 << 12),
-	MUXFLAG_BEEP_STOP = (1 << 13),
-	MUXFLAG_DEPRECATED_RWSYNC = (1 << 14),
-	MUXFLAG_NO_RWSYNC = (1 << 15),
-	MUXFLAG_AUTO_DELETE = (1 << 16),
-	MUXFLAG_REAL_CALLERID = (1 << 17),
+	MUXFLAG_EAMD = (1 << 8),
+	MUXFLAG_COMBINED = (1 << 9),
+	MUXFLAG_UID = (1 << 10),
+	MUXFLAG_VMRECIPIENTS = (1 << 11),
+	MUXFLAG_BEEP = (1 << 12),
+	MUXFLAG_BEEP_START = (1 << 13),
+	MUXFLAG_BEEP_STOP = (1 << 14),
+	MUXFLAG_DEPRECATED_RWSYNC = (1 << 15),
+	MUXFLAG_NO_RWSYNC = (1 << 16),
+	MUXFLAG_AUTO_DELETE = (1 << 17),
+	MUXFLAG_REAL_CALLERID = (1 << 18),
 };
 
 enum mixmonitor_args {
@@ -427,6 +437,7 @@ enum mixmonitor_args {
 	OPT_ARG_VOLUME,
 	OPT_ARG_WRITENAME,
 	OPT_ARG_READNAME,
+	OPT_ARG_EAMDNAME,
 	OPT_ARG_UID,
 	OPT_ARG_VMRECIPIENTS,
 	OPT_ARG_BEEP_INTERVAL,
@@ -447,6 +458,7 @@ AST_APP_OPTIONS(mixmonitor_opts, {
 	AST_APP_OPTION_ARG('V', MUXFLAG_WRITEVOLUME, OPT_ARG_WRITEVOLUME),
 	AST_APP_OPTION_ARG('W', MUXFLAG_VOLUME, OPT_ARG_VOLUME),
 	AST_APP_OPTION_ARG('r', MUXFLAG_READ, OPT_ARG_READNAME),
+	AST_APP_OPTION_ARG('e', MUXFLAG_EAMD, OPT_ARG_EAMDNAME),
 	AST_APP_OPTION_ARG('t', MUXFLAG_WRITE, OPT_ARG_WRITENAME),
 	AST_APP_OPTION_ARG('i', MUXFLAG_UID, OPT_ARG_UID),
 	AST_APP_OPTION_ARG('m', MUXFLAG_VMRECIPIENTS, OPT_ARG_VMRECIPIENTS),
@@ -465,6 +477,7 @@ struct mixmonitor_ds {
 
 	struct ast_filestream *fs;
 	struct ast_filestream *fs_read;
+	struct ast_filestream *fs_eamd;
 	struct ast_filestream *fs_write;
 
 	struct ast_audiohook *audiohook;
@@ -496,6 +509,13 @@ static void mixmonitor_ds_close_fs(struct mixmonitor_ds *mixmonitor_ds)
 		ast_verb(2, "MixMonitor close filestream (read)\n");
 	}
 
+	if (mixmonitor_ds->fs_eamd) {
+		quitting = 1;
+		ast_closestream(mixmonitor_ds->fs_eamd);
+		mixmonitor_ds->fs_eamd = NULL;
+		ast_verb(2, "MixMonitor close filestream (eamd)\n");
+	}
+
 	if (mixmonitor_ds->fs_write) {
 		quitting = 1;
 		ast_closestream(mixmonitor_ds->fs_write);
@@ -505,6 +525,19 @@ static void mixmonitor_ds_close_fs(struct mixmonitor_ds *mixmonitor_ds)
 
 	if (quitting) {
 		mixmonitor_ds->fs_quit = 1;
+	}
+}
+
+/*!
+ * \internal
+ * \pre mixmonitor_ds must be locked before calling this function
+ */
+static void mixmonitor_ds_close_fs_eamd(struct mixmonitor_ds *mixmonitor_ds)
+{
+	if (mixmonitor_ds->fs_eamd) {
+		ast_closestream(mixmonitor_ds->fs_eamd);
+		mixmonitor_ds->fs_eamd = NULL;
+		ast_verb(2, "MixMonitor close filestream (eamd) early @ 10sec for EAMD\n");
 	}
 }
 
@@ -629,6 +662,7 @@ static void mixmonitor_free(struct mixmonitor *mixmonitor)
 		ast_free(mixmonitor->filename);
 		ast_free(mixmonitor->filename_write);
 		ast_free(mixmonitor->filename_read);
+		ast_free(mixmonitor->filename_eamd);
 
 		/* Free everything in the recipient list */
 		clear_mixmonitor_recipient_list(mixmonitor);
@@ -727,14 +761,17 @@ static void *mixmonitor_thread(void *obj)
 	char *fs_ext = "";
 	char *fs_read_ext = "";
 	char *fs_write_ext = "";
+	char *fs_eamd_ext = "";
 
 	struct ast_filestream **fs = NULL;
 	struct ast_filestream **fs_read = NULL;
 	struct ast_filestream **fs_write = NULL;
+	struct ast_filestream **fs_eamd = NULL;
 
 	unsigned int oflags;
 	int errflag = 0;
 	struct ast_format *format_slin;
+	int eamd_samples_remaining;
 
 	/* Keep callid association before any log messages */
 	if (mixmonitor->callid) {
@@ -746,21 +783,26 @@ static void *mixmonitor_thread(void *obj)
 	fs = &mixmonitor->mixmonitor_ds->fs;
 	fs_read = &mixmonitor->mixmonitor_ds->fs_read;
 	fs_write = &mixmonitor->mixmonitor_ds->fs_write;
+	fs_eamd = &mixmonitor->mixmonitor_ds->fs_eamd;
 
 	ast_mutex_lock(&mixmonitor->mixmonitor_ds->lock);
 	mixmonitor_save_prep(mixmonitor, mixmonitor->filename, fs, &oflags, &errflag, &fs_ext);
 	mixmonitor_save_prep(mixmonitor, mixmonitor->filename_read, fs_read, &oflags, &errflag, &fs_read_ext);
 	mixmonitor_save_prep(mixmonitor, mixmonitor->filename_write, fs_write, &oflags, &errflag, &fs_write_ext);
+	mixmonitor_save_prep(mixmonitor, mixmonitor->filename_eamd, fs_eamd, &oflags, &errflag, &fs_eamd_ext);
 
 	format_slin = ast_format_cache_get_slin_by_rate(mixmonitor->mixmonitor_ds->samp_rate);
 
 	ast_mutex_unlock(&mixmonitor->mixmonitor_ds->lock);
 
+	/* collect 10 seconds of samples for EAMD (AmeriSave Enhanced AMD) */
+	eamd_samples_remaining = 10 * mixmonitor->mixmonitor_ds->samp_rate;
+
 	/* The audiohook must enter and exit the loop locked */
 	ast_audiohook_lock(&mixmonitor->audiohook);
 	while (mixmonitor->audiohook.status == AST_AUDIOHOOK_STATUS_RUNNING && !mixmonitor->mixmonitor_ds->fs_quit) {
 		struct ast_frame *fr = NULL;
-		struct ast_frame *fr_read = NULL;
+		struct ast_frame *fr_read = NULL; /* this frame is stored in both the read and eamd files */
 		struct ast_frame *fr_write = NULL;
 
 		if (!(fr = ast_audiohook_read_frame_all(&mixmonitor->audiohook, SAMPLES_PER_FRAME, format_slin,
@@ -782,6 +824,28 @@ static void *mixmonitor_thread(void *obj)
 			ast_mutex_lock(&mixmonitor->mixmonitor_ds->lock);
 
 			/* Write out the frame(s) */
+			if ((*fs_eamd) && (fr_read)) {
+				struct ast_frame *cur;
+
+				for (cur = fr_read; cur && eamd_samples_remaining > 0; cur = AST_LIST_NEXT(cur, frame_list)) {
+					ast_writestream(*fs_eamd, cur);
+					/*
+						Flush file on every frame so EAMD process can get near realtime
+						output (at least at the frame granularity)
+						Recording should be saved to a RAM drive for even better performance
+						and to eliminate file fragmentation issues
+					*/
+					fflush((*fs_eamd)->f);
+					eamd_samples_remaining -= cur->samples;
+					if (eamd_samples_remaining <= 0)
+					{
+						// once we've passed 10 seconds, close the file
+						mixmonitor_ds_close_fs_eamd(mixmonitor->mixmonitor_ds);
+						break;
+					}
+				}
+			}
+
 			if ((*fs_read) && (fr_read)) {
 				struct ast_frame *cur;
 
@@ -961,7 +1025,7 @@ static void mixmonitor_ds_remove_and_free(struct ast_channel *chan, const char *
 static int launch_monitor_thread(struct ast_channel *chan, const char *filename,
 				  unsigned int flags, int readvol, int writevol,
 				  const char *post_process, const char *filename_write,
-				  char *filename_read, const char *uid_channel_var,
+				  char *filename_read, char *filename_eamd, const char *uid_channel_var,
 				  const char *recipients, const char *beep_id)
 {
 	pthread_t thread;
@@ -1019,6 +1083,10 @@ static int launch_monitor_thread(struct ast_channel *chan, const char *filename,
 
 	if (!ast_strlen_zero(filename_read)) {
 		mixmonitor->filename_read = ast_strdup(filename_read);
+	}
+
+	if (!ast_strlen_zero(filename_eamd)) {
+		mixmonitor->filename_eamd = ast_strdup(filename_eamd);
 	}
 
 	if (setup_mixmonitor_ds(mixmonitor, chan, &datastore_id, beep_id)) {
@@ -1161,6 +1229,7 @@ static int mixmonitor_exec(struct ast_channel *chan, const char *data)
 {
 	int x, readvol = 0, writevol = 0;
 	char *filename_read = NULL;
+	char *filename_eamd = NULL;
 	char *filename_write = NULL;
 	char filename_buffer[1024] = "";
 	char *uid_channel_var = NULL;
@@ -1177,7 +1246,7 @@ static int mixmonitor_exec(struct ast_channel *chan, const char *data)
 	);
 
 	if (ast_strlen_zero(data)) {
-		ast_log(LOG_WARNING, "MixMonitor requires an argument (filename or ,t(filename) and/or r(filename)\n");
+		ast_log(LOG_WARNING, "MixMonitor requires an argument (filename or ,t(filename), r(filename) and/or e(filename))\n");
 		return -1;
 	}
 
@@ -1241,6 +1310,10 @@ static int mixmonitor_exec(struct ast_channel *chan, const char *data)
 			filename_read = ast_strdupa(filename_parse(opts[OPT_ARG_READNAME], filename_buffer, sizeof(filename_buffer)));
 		}
 
+		if (ast_test_flag(&flags, MUXFLAG_EAMD)) {
+			filename_eamd = ast_strdupa(filename_parse(opts[OPT_ARG_EAMDNAME], filename_buffer, sizeof(filename_buffer)));
+		}
+
 		if (ast_test_flag(&flags, MUXFLAG_UID)) {
 			uid_channel_var = opts[OPT_ARG_UID];
 		}
@@ -1262,7 +1335,7 @@ static int mixmonitor_exec(struct ast_channel *chan, const char *data)
 	}
 	/* If there are no file writing arguments/options for the mix monitor, send a warning message and return -1 */
 
-	if (!ast_test_flag(&flags, MUXFLAG_WRITE) && !ast_test_flag(&flags, MUXFLAG_READ) && ast_strlen_zero(args.filename)) {
+	if (!ast_test_flag(&flags, MUXFLAG_WRITE) && !ast_test_flag(&flags, MUXFLAG_READ) && !ast_test_flag(&flags, MUXFLAG_EAMD) && ast_strlen_zero(args.filename)) {
 		ast_log(LOG_WARNING, "MixMonitor requires an argument (filename)\n");
 		return -1;
 	}
@@ -1284,6 +1357,7 @@ static int mixmonitor_exec(struct ast_channel *chan, const char *data)
 			args.post_process,
 			filename_write,
 			filename_read,
+			filename_eamd,
 			uid_channel_var,
 			recipients,
 			beep_id)) {
@@ -1422,6 +1496,7 @@ static char *handle_cli_mixmonitor(struct ast_cli_entry *e, int cmd, struct ast_
 				char *filename = "";
 				char *filename_read = "";
 				char *filename_write = "";
+				char *filename_eamd = "";
 
 				mixmonitor_ds = datastore->data;
 				if (mixmonitor_ds->fs) {
@@ -1433,7 +1508,12 @@ static char *handle_cli_mixmonitor(struct ast_cli_entry *e, int cmd, struct ast_
 				if (mixmonitor_ds->fs_write) {
 					filename_write = mixmonitor_ds->fs_write->filename;
 				}
-				ast_cli(a->fd, "%p\t%s\t%s\t%s\n", mixmonitor_ds, filename, filename_read, filename_write);
+				if (mixmonitor_ds->fs_eamd) {
+					filename_eamd = mixmonitor_ds->fs_eamd->filename;
+				}
+
+				ast_cli(a->fd, "%p\t%s\t%s\t%s\t%s\n", mixmonitor_ds, filename, filename_read,
+					filename_write, filename_eamd);
 			}
 		}
 		ast_channel_unlock(chan);
